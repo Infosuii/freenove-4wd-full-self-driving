@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+ai-driver.log*
+driver.local.json
+.venv-win/

@@ -1,0 +1,8 @@
+{
+  "pi_host": "127.0.0.1",
+  "command_port": 65534,
+  "video_port": 65533,
+  "ollama_host": "127.0.0.1",
+  "ollama_port": 11434,
+  "model": "qwen2.5vl:7b"
+}

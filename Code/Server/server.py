@@ -1,13 +1,14 @@
 import socket  # Import the socket module for network communication
 import fcntl   # Import the fcntl module for I/O control
 import struct  # Import the struct module for packing and unpacking data
+import logging
 from tcp_server import TCPServer  # Import the TCPServer class from the tcp_server module
 
 class Server:
-    def __init__(self):
+    def __init__(self, bind_address=None):
         """Initialize the TankServer class."""
-        self.ip_address = self.get_interface_ip()  # Get the IP address of the network interface
-        self.command_server = TCPServer()          # Initialize the command server
+        self.ip_address = bind_address or self.get_interface_ip()
+        self.command_server = TCPServer(newline_framing=True)
         self.video_server = TCPServer()            # Initialize the video server
         self.command_server_is_busy = False        # Flag to indicate whether the command server is busy
         self.video_server_is_busy = False          # Flag to indicate whether the video server is busy
@@ -67,7 +68,7 @@ class Server:
             else:
                 self.command_server.send_to_all_client(data)         # Send data to all connected clients of the command server
         except Exception as e:
-            print(e)
+            logging.exception("Command transmission failed")
         finally:
             self.set_command_server_busy(False)
 

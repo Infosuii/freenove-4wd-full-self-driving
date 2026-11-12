@@ -2,15 +2,35 @@ from gpiozero import DistanceSensor, PWMSoftwareFallback, DistanceSensorNoEcho
 import warnings
 import time
 
+class FreshDistanceSensor(DistanceSensor):
+    """Timestamp actual GPIOZero echo samples, including failed echoes.
+
+    GPIOZero's smoothed distance can retain old values after no-echo failures.
+    The guarded path reads this atomic sample instead of that cached median.
+    """
+    def __init__(self, *args, **kwargs):
+        self.latest_echo = (None, 0.0)
+        super().__init__(*args, **kwargs)
+
+    def _read(self):
+        value = super()._read()
+        self.latest_echo = (value, time.monotonic())
+        return value
+
 class Ultrasonic:
-    def __init__(self, trigger_pin: int = 27, echo_pin: int = 22, max_distance: float = 3.0):
+    def __init__(self, trigger_pin: int = 27, echo_pin: int = 22, max_distance: float = 3.0, track_freshness=False):
         # Initialize the Ultrasonic class and set up the distance sensor.
         warnings.filterwarnings("ignore", category = DistanceSensorNoEcho)
         warnings.filterwarnings("ignore", category = PWMSoftwareFallback)  # Ignore PWM software fallback warnings
         self.trigger_pin = trigger_pin  # Set the trigger pin number
         self.echo_pin = echo_pin        # Set the echo pin number
         self.max_distance = max_distance  # Set the maximum distance
-        self.sensor = DistanceSensor(echo=self.echo_pin, trigger=self.trigger_pin, max_distance=self.max_distance)  # Initialize the distance sensor
+        sensor_type = FreshDistanceSensor if track_freshness else DistanceSensor
+        self.sensor = sensor_type(echo=self.echo_pin, trigger=self.trigger_pin, max_distance=self.max_distance)
+
+    def get_fresh_sample(self):
+        value, timestamp = self.sensor.latest_echo
+        return (None if value is None else round(value * self.max_distance * 100, 1), timestamp)
 
     def __enter__(self):
         return self

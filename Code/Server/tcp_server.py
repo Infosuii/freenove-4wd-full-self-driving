@@ -4,14 +4,23 @@ import threading
 import fcntl
 import struct
 import queue
+import time
+import logging
+
+log = logging.getLogger(__name__)
 
 class TCPServer:
-    def __init__(self):
+    def __init__(self, newline_framing=False, on_disconnect=None):
+        self.newline_framing = newline_framing
+        self.on_disconnect = on_disconnect
+        self.receive_buffers = {}
+        self.send_lock = threading.Lock()
+        self.clients_lock = threading.RLock()
         # Initialize server and client sockets
         self.server_socket = None
         self.client_sockets = {}
         # Message queue for incoming messages
-        self.message_queue = queue.Queue()
+        self.message_queue = queue.Queue(maxsize=256)
         # Maximum number of clients allowed
         self.max_clients = 1
         # Current number of active connections
@@ -44,12 +53,17 @@ class TCPServer:
         # Accept new connections until the server is stopped
         while not self.stop_event.is_set():
             # Use select to monitor the server socket and the stop pipe
-            readable, writable, exceptional = select.select([self.server_socket, self.stop_pipe_r] + list(self.client_sockets.keys()), [], [])
+            try:
+                readable, writable, exceptional = select.select([self.server_socket, self.stop_pipe_r] + list(self.client_sockets.keys()), [], [])
+            except (OSError, ValueError):
+                # A send/disconnect worker can close a socket after this snapshot.
+                time.sleep(0.005)
+                continue
             for s in readable:
                 if s == self.server_socket and self.active_connections < self.max_clients:
                     # Accept a new connection if the maximum number of clients is not reached
                     client_socket, client_address = s.accept()
-                    client_socket.setblocking(0)
+                    client_socket.settimeout(0.2)
                     self.client_sockets[client_socket] = client_address
                     self.active_connections += 1
                     print(f"New connection from {client_address}, {self.active_connections} active connections.")
@@ -63,25 +77,32 @@ class TCPServer:
                     self.stop_event.set()
                     break
                 else:
+                    client_address = self.client_sockets.get(s)
+                    if client_address is None:
+                        continue
                     try:
                         # Receive data from the client
                         data = s.recv(1024)
                         if data:
-                            client_address = self.client_sockets[s]
-                            self.message_queue.put((client_address, data.decode('utf-8')))
+                            if self.newline_framing:
+                                buf = self.receive_buffers.get(s, b'') + data
+                                while b'\n' in buf:
+                                    line, buf = buf.split(b'\n', 1)
+                                    if len(line) > 1024:
+                                        raise ValueError('Command too long')
+                                    self.message_queue.put_nowait((client_address, line.decode('ascii') + '\n'))
+                                if len(buf) > 1024:
+                                    raise ValueError('Command too long')
+                                self.receive_buffers[s] = buf
+                            else:
+                                self.message_queue.put_nowait((client_address, data.decode('utf-8')))
                         else:
                             # Remove the client if no data is received
-                            client_address = self.client_sockets[s]
                             print(client_address, "disconnected")
                             self.remove_client(s)
-                    except OSError as e:
-                        if e.errno == 9 or e.errno == 32:
-                            # Handle broken pipe errors
-                            client_address = self.client_sockets[s]
-                            print(client_address, "disconnected")
-                            self.remove_client(s)
-                        else:
-                            print(f"Unexpected error: {e}")
+                    except (OSError, ValueError, queue.Full) as e:
+                        print(f"Client receive failure: {e}")
+                        self.remove_client(s)
             for s in exceptional:
                 # Handle exceptional conditions
                 client_address = self.client_sockets[s]
@@ -101,33 +122,40 @@ class TCPServer:
                     encoded_message = message.encode('utf-8')
                 else:
                     encoded_message = message
-                client_socket.sendall(encoded_message)
+                with self.send_lock:
+                    client_socket.sendall(encoded_message)
             except socket.error as e:
-                print(f"Error sending data to {self.client_sockets[client_socket]}: {e}")
+                log.warning("Error sending data: %s", e)
                 self.remove_client(client_socket)
 
     def send_to_client(self, client_address, message):
         # Send a message to a specific client
-        for client_socket, addr in self.client_sockets.items():
+        for client_socket, addr in list(self.client_sockets.items()):
             if addr == client_address:
                 try:
                     if isinstance(message, str):
                         encoded_message = message.encode('utf-8')
                     else:
                         encoded_message = message
-                    client_socket.sendall(encoded_message)
+                    with self.send_lock:
+                        client_socket.sendall(encoded_message)
                 except socket.error as e:
-                    print(f"Error sending data to {client_address}: {e}")
+                    log.warning("Error sending data to %s: %s", client_address, e)
                     self.remove_client(client_socket)
                 return
-        print(f"Client at {client_address} not found.")
+        log.warning("Client at %s not found", client_address)
 
     def remove_client(self, client_socket):
         # Remove a client from the server
-        if client_socket in self.client_sockets:
-            del self.client_sockets[client_socket]
+        with self.clients_lock:
+            address = self.client_sockets.pop(client_socket, None)
+            if address is None:
+                return
+            self.receive_buffers.pop(client_socket, None)
             client_socket.close()
             self.active_connections -= 1
+        if self.on_disconnect:
+            self.on_disconnect(address)
 
     def close(self):
         # Close the server and all client connections
@@ -137,8 +165,9 @@ class TCPServer:
         if self.server_socket is not None:
             self.server_socket.close()
         for s in list(self.client_sockets):
-            s.close()
-        self.client_sockets.clear()
+            self.remove_client(s)
+        self.stop_pipe_r.close()
+        self.stop_pipe_w.close()
         print("Server stopped.")
 
     def get_client_ips(self):

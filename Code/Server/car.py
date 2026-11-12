@@ -7,7 +7,9 @@ import time
 import math
 
 class Car:
-    def __init__(self):
+    def __init__(self, enable_servos=True, fresh_sonic=False):
+        self.enable_servos = enable_servos
+        self.fresh_sonic = fresh_sonic
         self.servo = None
         self.sonic = None
         self.motor = None
@@ -20,12 +22,14 @@ class Car:
         self.time_compensate = 3 #Depend on your own car,If you want to get the best out of the rotation mode, change the value by experimenting.
         self.start()
     def start(self):  
-        if self.servo is None:
+        if self.servo is None and self.enable_servos:
             self.servo = Servo()
         if self.sonic is None:
-            self.sonic = Ultrasonic()
+            self.sonic = Ultrasonic(track_freshness=self.fresh_sonic)
         if self.motor is None:
             self.motor = Ordinary_Car()
+            if self.fresh_sonic:
+                self.motor.set_motor_model(0, 0, 0, 0)
         if self.infrared is None:
             self.infrared = Infrared()
         if self.adc is None:

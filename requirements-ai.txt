@@ -1,0 +1,3 @@
+# Existing laptop GUI/image dependencies reused; networking uses the stdlib.
+PyQt5>=5.15,<6
+Pillow>=10,<13

@@ -20,7 +20,7 @@ class StreamingOutput(io.BufferedIOBase):
         return len(buf)
 
 class Camera:
-    def __init__(self, preview_size: tuple = (640, 480), hflip: bool = False, vflip: bool = False, stream_size: tuple = (400, 300)):
+    def __init__(self, preview_size: tuple = (640, 480), hflip: bool = False, vflip: bool = True, stream_size: tuple = (400, 300)):
         """Initialize the Camera class."""
         self.camera = Picamera2()  # Initialize the Picamera2 object
         self.transform = Transform(hflip=1 if hflip else 0, vflip=1 if vflip else 0)  # Set the transformation for flipping the image
@@ -72,10 +72,11 @@ class Camera:
             except Exception as e:
                 print(f"Error stopping stream: {e}")       # Print error message if stopping fails
 
-    def get_frame(self) -> bytes:
+    def get_frame(self, timeout=1.0) -> bytes:
         """Get the current frame from the streaming output."""
         with self.streaming_output.condition:
-            self.streaming_output.condition.wait()         # Wait for a new frame to be available
+            if not self.streaming_output.condition.wait(timeout):
+                return None
             return self.streaming_output.frame             # Return the current frame
 
     def save_video(self, filename: str, duration: int = 10) -> None:

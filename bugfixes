@@ -1,0 +1,355 @@
+# Bug Report: Verified Source Review
+
+Reviewed: 2026-09-17.
+
+This report replaces the earlier analysis, including inaccurate explanations introduced during its initial review. Original bug IDs are retained for traceability; their prefixes are historical labels, not validated severity rankings. No bug fixes were attempted.
+
+## Scope and verification limits
+
+- Reviewed the application source in `Code/Server`, `Code/Client`, and the setup scripts. This is not an exhaustive audit of vendored libraries or packaged applications.
+- Findings below are based on source/control-flow inspection. Pillow and Qt behavior was also checked against library implementation/documentation; a small in-memory Pillow check confirmed its seek behavior.
+- The service, GUI, motors, camera, GPIO tests, and installers were not run. Hardware behavior, timing, CPU percentages, disk wear, and distribution-specific startup failures have not been measured.
+- No project lint/typecheck or hardware-free automated test command was found. Hardware test scripts were deliberately not run for this documentation-only task.
+- Only this document was edited. The existing working-tree `Code/Server/camera.py` change was left untouched.
+
+## Summary
+
+All **33 original entries** were reviewed:
+
+| Verdict | Count | Meaning |
+| :--- | ---: | :--- |
+| Confirmed | 12 | The central defect follows directly from inspected source. |
+| Qualified | 17 | A real defect or concern exists, but the original mechanism, scope, certainty, or impact needs correction. |
+| Refuted as written | 4 | The reported failure is contradicted by source or established library behavior. |
+
+**12 additional findings** are recorded in Section 2. Severity is assigned there according to demonstrated software impact and potential loss of motor control, not unmeasured hardware effects.
+
+## 1. Verification of original findings
+
+### BUG-CRIT-01 — Photoresistor import and API mismatch
+
+**Verdict: Qualified.** The module is broken, but not an established server-wide startup failure.
+
+- `Code/Server/photoresistor.py:1` imports `Adc`; `Code/Server/adc.py:5` defines `ADC`.
+- The calls at `photoresistor.py:12`, `photoresistor.py:20`, and `photoresistor.py:27` use nonexistent methods; the actual methods are `adc.py:23` (`read_adc`) and `adc.py:41` (`close_i2c`).
+- Import fails once the prerequisite imports are available. If the import mismatch alone were corrected, the two read methods would catch their `AttributeError` and return `None`, not propagate it. `stop()` would still raise.
+- `Code/Server/car.py:5` uses `ADC` directly, so the main car's light mode does not depend on this broken wrapper.
+
+### BUG-CRIT-02 — LED standalone entry-point name
+
+**Verdict: Confirmed.** `Code/Server/rpi_ledpixel.py:166` calls `FreenoveRPIWS281X`, while the class at line 4 is `Freenove_RPI_WS281X`.
+
+Direct execution reaches a `NameError` if prerequisite imports succeed. Normal server imports do not execute this entry point; this is not a whole-server Critical failure.
+
+### BUG-CRIT-03 — Rotation thread bookkeeping
+
+**Verdict: Qualified.** Thread management is inconsistent, but the original explanation incorrectly treated a loop-local variable as if it disappeared between commands.
+
+- `Code/Server/main.py:239` assigns local `Rotate_Mode` inside the long-running `threading_cmd_receive()` invocation. That local remains available in subsequent loop iterations.
+- A stop received before any rotation start can raise `UnboundLocalError` at line 218, but the exception is caught at lines 220–221.
+- `self.Rotate_Mode` at line 235 is never assigned; that exception is also caught.
+- Once rotation has started, line 218 can reach its local thread. However, `rotation_flag = False` at line 219 is skipped if `stop_thread()` raises. The repeated asynchronous aborts in `Code/Server/Thread.py:20` can raise for an already-ended thread, leaving the flag stale and preventing a later start.
+- Do not describe every rotation stop as impossible or these caught exceptions as command-thread crashes. Additional motor ownership/stop-path problems are recorded under BUG-NEW-02.
+
+### BUG-CRIT-04 — Missing command parameter checks
+
+**Verdict: Confirmed by static inspection.** `Code/Server/main.py:175`, `main.py:200`, and `main.py:244` index parameters without the protection used in neighboring dispatch branches.
+
+`Code/Server/message.py:32`–47 can leave the parameter list empty or shorter than expected. The resulting indexing exception can terminate the command worker, not necessarily the whole process. There is no motor-stop cleanup around that worker. No malformed-input network reproduction was performed. Normal TCP fragmentation also matters; see BUG-NEW-01.
+
+### BUG-CRIT-05 — Relative parameter file and interactive startup
+
+**Verdict: Qualified.** `Code/Server/parameter.py:8` uses a CWD-relative path. Missing or invalid parameters enter `deal_with_param()` at lines 12–13.
+
+The actual missing-file path goes through `get_valid_input()` at lines 106–107 and `input()` at line 120, not the re-entry question at line 102. If standard input is closed/at EOF, the uncaught `EOFError` aborts initialization; an open pipe can instead block. Absence of a TTY alone does not guarantee EOF. Existing valid parameters in the correct CWD avoid this path.
+
+`Code/Server/params.json` exists locally but was **not git-tracked** in this checkout. It must not be described as a tracked file. This parameter problem is separate from the Qt headless problem in BUG-NEW-03.
+
+### BUG-CRIT-06 — Readable/exceptional socket overlap
+
+**Verdict: Refuted as written.** `Code/Server/tcp_server.py:47` passes an empty third list to `select.select()`. Consequently, its returned exceptional list is empty and the loop at lines 85–89 cannot produce the described failure.
+
+The reason is **not** a POSIX guarantee that readiness sets are mutually exclusive; descriptors can appear in multiple requested readiness sets. This verdict concerns only the claimed exceptional-loop path, not every possible concurrent socket race.
+
+### BUG-CRIT-07 — Loopback fallback prevents remote connections
+
+**Verdict: Confirmed.** `Code/Server/server.py:9` records the address once; the interface lookup at lines 15–27 returns `127.0.0.1` on failure, and lines 32–33 bind both listeners to that address.
+
+If Wi-Fi is unavailable at lookup time, or the machine uses a different interface, later Wi-Fi availability does not change those bindings. Boot timing is a condition, not an observed failure on this machine.
+
+The separate helper at `Code/Server/tcp_server.py:148` does not have this fallback and is used by that module's standalone entry point, not by `Server.__init__()`.
+
+### BUG-CRIT-08 — Client IP file startup failure
+
+**Verdict: Qualified.** `Code/Client/Main.py:44` opens CWD-relative `IP.txt` without handling read errors. A missing/unreadable file prevents client initialization.
+
+However, `Code/Client/IP.txt` **is tracked**, so a fresh clone launched from `Code/Client` does not inherently lack it. Launching elsewhere can trigger the failure. The related write at `Main.py:757` also lacks error handling. This overlaps BUG-LOW-07.
+
+### BUG-CRIT-09 — Failed video connection
+
+**Verdict: Qualified.** After connection failure, `Code/Client/Video.py:60`–65 falls through to a loop that accesses `self.connection` at line 68. On a first failed connection this attribute is absent.
+
+The exception is caught at lines 76–78, printed once, and followed by `break`. Thus the original claims of an **unhandled** exception and **continuous** console spam are false. The real issue is failed-connection handling and misleading client state: `Code/Client/Main.py:770` displays “Disconnect” without checking either connection result.
+
+### BUG-CRIT-10 — Rotation voltage and ultrasonic readings
+
+**Verdict: Qualified.** The zero-voltage division at `Code/Server/car.py:127` is real: `Code/Server/adc.py:27`–29 can return `0.0`, and rotation has no local exception cleanup. This terminates the rotation thread, not inherently all server threads.
+
+The ultrasonic claim is not established for an ordinary no-echo timeout. `Code/Server/ultrasonic.py:28`–33 returns `None` only upon catching a raised `RuntimeWarning`; the no-echo warning is suppressed at line 8 and is not that exception class in the inspected GPIOZero installation. Public distance reads normally return a number, may wait for initial samples, or may retain stale samples depending on GPIOZero state/version.
+
+The comparisons in `car.py:47` would indeed fail if explicitly given `None`, but that alone does not prove the alleged timeout path. Do not silently substitute nominal battery voltage as if it were a verified safe hardware response.
+
+### BUG-HIGH-01 — Telemetry command headers disagree
+
+**Verdict: Confirmed.** `Code/Server/main.py:99` and `main.py:109` send sonic/light readings under `CMD_MODE`. `Code/Client/Main.py:824`–831 only routes those readings under `CMD_SONIC` and `CMD_LIGHT`.
+
+The supplied desktop client therefore ignores those server replies. Also, the infrared branch at `main.py:284`–285 does not call `send_line_data()`; the helper can still be called through an explicit request at line 171. It is not completely unused.
+
+### BUG-HIGH-02 — LED brightness overwrites stored colors
+
+**Verdict: Qualified.** Both `Code/Server/rpi_ledpixel.py:54`–58 and `Code/Server/spi_ledpixel.py:94`–98 pass the entire flattened color array to a method expecting one RGB triple.
+
+The per-pixel setter reads only its first three entries and overwrites the original color storage. Distinct pixel colors are lost on brightness adjustment. For non-RGB orderings, including the GRB SPI configuration, the storage is channel-reordered (`spi_ledpixel.py:106`–108), so channel swapping and mutation of pixel zero also matter. “Every pixel becomes exactly pixel zero's original color” is not a complete description for those orderings. The original proposed three-element slice alone does not address that ordering problem.
+
+### BUG-HIGH-03 — LED worker unthrottled loop
+
+**Verdict: Qualified.** `Code/Server/main.py:347`–389 has no sleep or blocking queue wait. Manual mode simply passes; animation helpers return immediately between scheduled updates. Off mode repeatedly calls `colorBlink(0)`, whose implementation at `Code/Server/led.py:52`–54 sends redundant output.
+
+Excessive polling/work is established. Exact “100% CPU,” “millions of iterations,” heating, and bus saturation were not measured; actual SPI calls and driver waits limit throughput.
+
+### BUG-HIGH-04 — LED stop flag is not shared
+
+**Verdict: Qualified.** The child uses an ordinary instance boolean at `Code/Server/main.py:347`. Changing the parent's copy at line 336 does not cooperatively stop the child.
+
+However, lines 339–340 explicitly terminate and join the process, so this is not evidence that the normal stop path always leaves it alive or that queue communication fails. The concern is non-cooperative shutdown: termination does not reliably run the child's cleanup or switch off its last LED output.
+
+### BUG-HIGH-05 — Shared JPEG file between threads
+
+**Verdict: Qualified.** `Code/Client/Video.py:56` writes `video.jpg`, while `Code/Client/Main.py:881`–882 validates and loads it separately.
+
+The boolean `video_Flag` handoff at `Video.py:73`–75 and `Main.py:879`–887 is not a lock: a writer already past its check can overlap a GUI read, and the file can change after validation. Partial/changed reads and avoidable encode/file/decode work are real concerns. Claims of severe physical disk thrashing, rapid SSD wear, or per-frame flush-limited throughput are not established; filesystem caching matters.
+
+### BUG-HIGH-06 — Pillow EOF/file-handle exhaustion
+
+**Verdict: Refuted as written.** `Code/Client/Main.py:841`–850 uses a seekable file in a `with` statement. Pillow's `Image.open()` seeks that file back to zero before inspecting it; being at EOF is not itself a failure.
+
+The enclosing context manager closes the file, so the claimed handle exhaustion is also unsupported. Checked against installed Pillow 11.1.0 (`PIL/Image.py`, `Image.open`, seek/read implementation) and an in-memory seekable-image check. Concurrent file modification remains a separate issue. A genuine validator failure is BUG-NEW-09.
+
+### BUG-HIGH-07 — Setup dependency coverage
+
+**Verdict: Qualified.** `Code/setup.py:141`–152 omits explicit installation of several direct dependencies: `smbus` (`Code/Server/adc.py:1`, `pca9685.py:5`), `spidev` (`spi_ledpixel.py:2`), and Picamera2/libcamera (`camera.py:2`–5).
+
+OpenCV and Pillow are direct client dependencies (`Code/Client/Main.py:4`, `Main.py:12`), not direct imports in server `camera.py`. The Windows/macOS setup scripts include client packages. Raspberry Pi OS images may preinstall some dependencies, so an inevitable startup failure specifically at `smbus` is not proven. Installing `smbus2` alone also does not satisfy an unchanged `import smbus`.
+
+### BUG-MED-01 — Socket descriptor cleanup
+
+**Verdict: Qualified.** `Code/Server/tcp_server.py:24` creates a socketpair that `close()` at lines 132–142 does not close. Those two descriptors remain open while that server object remains reachable.
+
+The UDP lookup socket in `Code/Server/server.py:18` also lacks explicit closure, but ordinary CPython reference counting closes it once its local owner is released. Replacing an unreachable stopped server likewise permits its socketpair to be finalized. Therefore cumulative exhaustion on every reconnect/restart is not established. Explicit resource-lifetime defects should not be confused with proven permanent leaks.
+
+### BUG-MED-02 — Asynchronous thread termination
+
+**Verdict: Qualified.** `Code/Server/Thread.py:7`–22 and `Code/Client/Thread.py:5`–17 inject `SystemExit` through ctypes instead of cooperating with the worker.
+
+An arbitrary interruption can skip required application cleanup, and repeated server-side calls can encounter an already-ended thread and raise `ValueError`. This is timing-dependent. Python `finally` blocks/context managers can still run, and blocked native calls need not stop immediately. The original statement that every held lock is never released, including internal GIL state, is unsupported.
+
+### BUG-MED-03 — GUI sleep on W release
+
+**Verdict: Confirmed.** `Code/Client/Main.py:363`–368 sleeps for 50 ms on the GUI thread before even excluding auto-repeat releases. The event loop and stop-command dispatch are delayed for that interval; perceived stutter was not measured.
+
+### BUG-MED-04 — Mouse button logical operation
+
+**Verdict: Confirmed.** `Code/Client/Main.py:226` uses logical `and` rather than testing the left-button bit. Right/middle-button movement can enter the drag branch and use a stale drag offset.
+
+### BUG-MED-05 — Ordinary-wheel keyboard movement
+
+**Verdict: Qualified.** `Code/Client/Main.py:468`–526 lacks wheel-type checks, but `on_btn_wheelchange()` at lines 528–541 hides the corresponding buttons in ordinary-wheel mode.
+
+The actual remaining path is the keyboard: A/D/Q/E/Z/X at lines 338–355 still invoke those handlers, transmitting mecanum/rotation commands on ordinary-wheel configuration. The original ordinary-wheel visible-button scenario was inaccurate. Physical motion depends on the wheels and hardware.
+
+### BUG-MED-06 — Direct LED control requires manual mode
+
+**Verdict: Confirmed behavior; Medium usability/protocol issue.** `Code/Server/main.py:67` defaults LED mode to zero and line 354 accepts individual LED updates only in mode one.
+
+The client's individual checkbox handlers at `Code/Client/Main.py:653`–700 do not enable that mode. Mode one must be selected first. Requiring a manual mode could be intentional, but the unchecked precondition leaves otherwise available individual controls silently ineffective.
+
+### BUG-MED-07 — Blink animation omits blue
+
+**Verdict: Confirmed.** `Code/Server/led.py:44` defines six states, while line 49 indexes modulo four. Blue is unreachable. This is a cosmetic animation defect rather than major feature failure.
+
+### BUG-MED-08 — Native close bypasses custom cleanup
+
+**Verdict: Qualified.** `Code/Client/Main.py:197` connects a custom button to `close()` at line 782. No `closeEvent()` handles window-manager closure.
+
+An OS close event can bypass that custom method while non-daemon workers exist. The window is frameless (`Main.py:62`), so a normal decorated title-bar X is not the usual scenario; an Alt+F4/window-manager close is. Thread lifetime and actual exit behavior depend on connection state. Even the custom close path has another cleanup defect; see BUG-NEW-04.
+
+### BUG-MED-09 — Windows setup retry instruction
+
+**Verdict: Qualified; Low severity.** `Code/setup_windows.py:30` prints a `sudo python setup_windows.py` retry instruction. It is nonportable Windows guidance, not a failure in the installer commands themselves.
+
+The absolute claim that Windows never has `sudo` is obsolete: newer Windows versions offer optional Sudo. Elevation is not automatically the appropriate remedy for every package-installation failure.
+
+### BUG-LOW-01 — Integer None checks
+
+**Verdict: Confirmed code-quality issue.** The checks after integer conversion at `Code/Server/main.py:191`, `main.py:209`, and `main.py:360` cannot detect failed conversion: `int()` returns an integer or raises. These checks do not provide the apparent validation.
+
+### BUG-LOW-02 — Literal wildcard image files
+
+**Verdict: Refuted as written.** `Code/Client/Main.py:53`–57 performs literal filename operations; Qt does not expand those strings as globs. However, after a failed image load the `QImage` is null, and Qt 5.15 `QImage::save()` returns false before creating a writer for a null image.
+
+Thus failed loads do not create the claimed garbage files. Literal `*.png`/`*.jpg` names are legal on Linux; if such a valid image already exists, load/save can instead rewrite it. These lines are questionable cleanup material, not the stated file-creation bug.
+
+### BUG-LOW-03 — Out-of-range battery percentage
+
+**Verdict: Confirmed.** `Code/Client/Main.py:833` calculates an unclamped percentage and passes it through to a progress bar configured for 0–100 at lines 76–77.
+
+Qt ignores values outside the allowed range rather than displaying a negative/oversized bar, so the practical effect can be a stale or unchanged indication at battery extremes.
+
+### BUG-LOW-04 — Failure exit code on normal server close
+
+**Verdict: Confirmed.** `Code/Server/main.py:416` uses `sys.exit(1)` even on the ordinary close path. A supervisor configured to restart on failure can treat that as a failure. No particular systemd unit or restart loop was tested.
+
+### BUG-LOW-05 — Different Pi version number mappings
+
+**Verdict: Refuted as a functional bug.** `Code/setup.py:39`–47 uses a local three-way installation classification; `Code/Server/parameter.py:85`–88 uses a two-way runtime classification.
+
+Setup does not store its classification integer in runtime `params.json`. The different numeric conventions therefore do not establish a runtime enum mismatch. They may be confusing naming, but should not count as a verified bug.
+
+### BUG-LOW-06 — Infrared standalone busy polling
+
+**Verdict: Qualified.** `Code/Server/test.py:69`–78 repeatedly polls infrared values without a delay. Excessive polling is present, but exact 100% CPU use is unmeasured and depends on initial sampling, scheduling, and output blocking. Other standalone examples have similar loops; see BUG-NEW-12.
+
+### BUG-LOW-07 — CWD-relative resources
+
+**Verdict: Confirmed, with overlap.** `Code/Client/Main.py:44`, `Main.py:58`–59, `Code/Client/Video.py:15`, and `Code/Server/parameter.py:8` use CWD-relative resources.
+
+Launching from another directory can fail to load configuration, images, or the face cascade. Missing cascade data is not checked before `detectMultiScale()` at `Video.py:47`, so video processing can fail later. The IP/parameter parts duplicate BUG-CRIT-08/05 and should not be counted as independent root causes.
+
+## 2. Additional findings
+
+These are source-verified defects or explicitly conditional failure paths. They have not been reproduced on the physical car.
+
+### BUG-NEW-01 — Server does not assemble complete TCP commands
+
+**Severity: High.** Evidence: `Code/Server/tcp_server.py:68`–71; `Code/Server/main.py:149`–159.
+
+The transport queues each receive chunk, and command processing strips it and dispatches even a trailing fragment without waiting for a newline. TCP preserves byte order, not application message boundaries. A legitimate command split across reads can consequently be discarded, misinterpreted, or passed with missing parameters. This is distinct from merely validating command argument counts in BUG-CRIT-04. No network reproduction was performed.
+
+### BUG-NEW-02 — Motor outputs are not safely stopped at control-lifecycle boundaries
+
+**Severity: High, safety-relevant.** Evidence: `Code/Server/main.py:84`–92, `main.py:187`–256, `main.py:277`–289; `Code/Server/tcp_server.py:125`–130; `Code/Server/car.py:125`–139.
+
+- The GUI “Server Off” path closes networking and stops workers but does not send a motor stop or call `stop_car()`. Stopping Python workers does not itself reset the last commanded PWM outputs.
+- Removing a disconnected command client only updates socket bookkeeping. The car worker has no disconnection check or command watchdog, so losing control connectivity does not automatically stop manual motion or autonomous mode.
+- The rotation worker runs its own infinite loop. Ordinary motor commands, mode changes, and the Server Off path do not cancel it. A stop issued through another motor-command branch can be overwritten by its next iteration.
+
+These are missing software stop/ownership paths; actual continued wheel motion was not tested. They are separate from the caught-name/stale-flag problem in BUG-CRIT-03.
+
+### BUG-NEW-03 — Terminal mode still requires GUI initialization
+
+**Severity: High for headless deployments.** Evidence: `Code/Server/main.py:22`–26, `main.py:431`–452.
+
+The advertised no-GUI flags still construct `QApplication` and a `QMainWindow`, including `setupUi()`. With a normal Qt platform backend and no display server, startup can fail before car initialization. A configured offscreen backend may avoid the display failure; the flags alone do not provide that configuration.
+
+The headless branch also constructs a second `QApplication` inside `mywindow.__init__()` after creating the first at line 440, contrary to Qt's one-application-per-process requirement. Exact failure behavior is platform-dependent and was not exercised.
+
+### BUG-NEW-04 — Client connection cleanup leaves workers/state/resources behind
+
+**Severity: Medium.** Evidence: `Code/Client/Main.py:772`–808; `Code/Client/Video.py:20`–30, `Video.py:62`, `Video.py:80`–99.
+
+- The custom close method stops receive/video workers but omits the non-daemon power worker. If connection establishment failed, `sendData()` returns without raising and that worker can continue its infinite sleep/query loop after GUI exit.
+- Both disconnect and close group several `stop_thread()` calls in one try block. An exception for an already-ended first thread skips cleanup of the remaining threads.
+- `StopTcpcClient()` groups all shutdown/close calls in one try block. Failure to shut down the video socket skips the command socket shutdown and both explicit closes.
+- It never clears `connect_Flag` or explicitly closes the `makefile('rb')` object. Subsequent GUI actions can attempt sends on a closed socket; the retained file wrapper can prolong the video socket's resource lifetime.
+
+These are deterministic missing cleanup/state transitions, with observable symptoms conditional on connection/thread state. They are additional to the OS-close-event omission in BUG-MED-08.
+
+### BUG-NEW-05 — Three diagonal rotation controls transmit the same direction
+
+**Severity: Medium.** Evidence: `Code/Client/Main.py:494`–516.
+
+The rotation branches of upper-left, upper-right, and lower-left diagonal handlers all transmit angle `135` with the same remaining parameters. Distinct direction controls therefore become indistinguishable to the server in rotation mode. The appropriate replacement angles require confirmation of the intended coordinate convention; no values were changed.
+
+### BUG-NEW-06 — HSV conversion selects the wrong sector
+
+**Severity: Low.** Evidence: `Code/Server/rpi_ledpixel.py:131`–163; `Code/Server/spi_ledpixel.py:195`–227.
+
+Both implementations select the hue sector with `round(h / 60)` rather than the sector containing the hue. For example, hue 45 degrees with full saturation/value follows the second sector and yields approximately `[64, 255, 0]` instead of approximately `[255, 191, 0]`. This arithmetic establishes the color error without LED execution. Neither helper's use in normal server operation was established.
+
+### BUG-NEW-07 — Camera frame waits and video worker shutdown are not coordinated
+
+**Severity: Medium.** Evidence: `Code/Server/camera.py:66`–79, `camera.py:87`–91; `Code/Server/main.py:303`–321.
+
+`get_frame()` waits on a condition without a timeout, stop predicate, or shutdown notification. If frame production ceases while a reader waits, `stop_stream()` and `close()` do not wake it. The video worker's inner loop also ignores `video_thread_is_running` while a client remains connected. Its stop method times out after 0.3 seconds and discards the thread reference even if it is still alive.
+
+A stalled camera can therefore leave a non-daemon worker blocked beyond shutdown, and forgotten workers may overlap a later restart. Occurrence depends on timing/camera state; no camera-stall test was run.
+
+### BUG-NEW-08 — ADC stability loop has no termination bound
+
+**Severity: Medium.** Evidence: `Code/Server/adc.py:15`–27; `Code/Server/main.py:124` and `main.py:173`.
+
+A read completes only after two consecutive ADC bytes match. Persistently changing/noisy readings can keep the loop running indefinitely, with no deadline, retry limit, or cancellation check. Because battery queries execute that read directly in the command worker, the worker can stop processing all subsequent commands while waiting. The software nontermination condition is clear; its frequency on actual hardware is unknown.
+
+### BUG-NEW-09 — JPEG validator returns success on file-open failure
+
+**Severity: Low.** Evidence: `Code/Client/Main.py:837`–857, `Main.py:881`–882.
+
+`bValid` starts true. If opening or reading `video.jpg` raises before it is changed, the outer bare exception handler ignores the error and returns true. A nonexistent or unreadable file is therefore reported valid and passed to `QPixmap`, potentially clearing the video display. This is independent of the refuted Pillow EOF claim.
+
+### BUG-NEW-10 — Saving a video while streaming silently fails to record
+
+**Severity: Medium for the Camera API.** Evidence: `Code/Server/camera.py:50`–64, `camera.py:81`–85.
+
+`save_video(filename)` calls `start_stream(filename)`, but `start_stream()` does nothing if streaming is already active. The method then sleeps and stops the existing stream without creating the requested recording. Its public API does not reject or explain that state. The normal server does not call `save_video()`, so this is not a demonstrated main-server recording regression.
+
+### BUG-NEW-11 — Server sends have no nonblocking backpressure handling
+
+**Severity: Medium.** Evidence: `Code/Server/tcp_server.py:52`, `tcp_server.py:96`–107, `tcp_server.py:109`–122; `Code/Server/main.py:315`–318.
+
+Accepted client sockets are nonblocking, but outgoing data uses `sendall()` without writable polling or an output buffer. Normal buffer pressure can raise `BlockingIOError`; it is treated as a socket failure and the client is removed. Video frames are particularly exposed to this on a slow connection. A healthy but temporarily slow client can thus lose its stream instead of receiving deferred output. This is a standard socket-API consequence, not a measured performance result or network reproduction.
+
+### BUG-NEW-12 — More standalone loops repeatedly poll or rewrite unchanged output
+
+**Severity: Low.** Evidence: `Code/Server/servo.py:35`–39; `Code/Server/car.py:141`–165.
+
+The servo entry point repeatedly writes the same two positions without a delay; the PWM controller maintains output without those repeated writes. The standalone sonic/infrared/light car tests repeatedly call time-gated mode methods without sleeping between calls. Their internal time checks reduce hardware updates but do not throttle the surrounding polling loops.
+
+These are additional instances of unnecessary CPU/I²C work, not measured 100% CPU or verified hardware damage. They were not executed.
+
+## 3. Important non-findings
+
+- `Code/Server/message.py:38`–45 explicitly maps the client's `one`, `two`, `three`, and `four` mode words to the server's corresponding numeric modes. Those words are not a mode-command protocol bug.
+- Rejected clients are explicitly closed at `Code/Server/tcp_server.py:58`–59. A claim that rejected sockets are never closed is false.
+- Source review is not proof of physical stop distances, battery behavior, flash wear, or exact resource/CPU consumption. Findings involving those outcomes require a separately authorized, hardware-safe test plan.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

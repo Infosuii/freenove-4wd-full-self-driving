@@ -4,6 +4,10 @@ import struct
 import time
 import signal
 import math
+import os
+import logging
+import queue
+from logging.handlers import QueueHandler, QueueListener
 from PyQt5.QtWidgets import QMainWindow, QApplication
 from PyQt5.QtCore import QTimer
 from server_ui import Ui_server_ui
@@ -18,10 +22,13 @@ from car import Car
 from buzzer import Buzzer
 from Thread import stop_thread
 from threading import Thread
+from driver_guard import DriverGuard
 
 class mywindow(QMainWindow, Ui_server_ui):
-    def __init__(self):
-        self.app = QApplication(sys.argv)
+    def __init__(self, options=None):
+        self.options = options
+        self.ai_safe = bool(options and options.ai_safe)
+        self.app = QApplication.instance() or QApplication(sys.argv)
         super(mywindow, self).__init__()
         self.setupUi(self)
         self.ui_button_state = True
@@ -38,10 +45,17 @@ class mywindow(QMainWindow, Ui_server_ui):
         self.time_record = time.time()
 
     def config_task(self):
-        self.tcp_server = Server()
+        self.tcp_server = Server(self.options.bind if self.options else None)
         self.command = Command()
         self.led = Led()
-        self.car = Car()
+        self.car = Car(enable_servos=not self.ai_safe, fresh_sonic=self.ai_safe)
+        self.guard = None
+        if self.ai_safe:
+            self.guard = DriverGuard(self.car.motor, self.tcp_server.send_data_to_command_client,
+                                     watchdog=self.options.watchdog,
+                                     max_duration=self.options.max_duration,
+                                     threshold=self.options.threshold)
+            self.tcp_server.command_server.on_disconnect = self.guard.disconnect
         self.buzzer = Buzzer()
         self.camera = Camera(stream_size=(400, 300))
         self.queue_cmd = multiprocessing.Queue()
@@ -76,12 +90,19 @@ class mywindow(QMainWindow, Ui_server_ui):
         if self.label.text() == "Server Off":
             self.label.setText("Server On")
             self.Button_Server.setText("Off")
-            self.tcp_server.start_tcp_servers()
+            self.tcp_server.start_tcp_servers(
+                self.options.command_port if self.options else 5000,
+                self.options.video_port if self.options else 8000)
+            if self.guard:
+                self.guard.start()
             self.set_threading_cmd_receive(True)
             self.set_threading_video_send(True)
             self.set_threading_car_task(True)
-            self.set_process_led_running(True)
+            if not self.ai_safe:
+                self.set_process_led_running(True)
         elif self.label.text() == 'Server On':
+            if self.guard:
+                self.guard.close()
             self.label.setText("Server Off")
             self.Button_Server.setText("On")
             self.tcp_server.stop_tcp_servers()
@@ -89,7 +110,10 @@ class mywindow(QMainWindow, Ui_server_ui):
             self.set_threading_video_send(False)
             self.set_threading_car_task(False)
             self.set_process_led_running(False)
-            self.tcp_server = Server()
+            self.tcp_server = Server(self.options.bind if self.options else None)
+            if self.guard:
+                self.guard.send = self.tcp_server.send_data_to_command_client
+                self.tcp_server.command_server.on_disconnect = self.guard.disconnect
 
     def send_sonic_data(self):
         if time.time() - self.send_sonic_data_time > 0.5:
@@ -147,6 +171,13 @@ class mywindow(QMainWindow, Ui_server_ui):
             cmd_queue = self.tcp_server.read_data_from_command_server()
             if cmd_queue.qsize() > 0:
                 client_address, all_message = cmd_queue.get()
+                if self.guard:
+                    if client_address in list(self.tcp_server.command_server.client_sockets.values()):
+                        try:
+                            self.guard.handle(all_message, client_address)
+                        except Exception:
+                            logging.exception("Guarded command failed; motors faulted")
+                    continue
                 main_message = all_message.strip()
                 if "\n" in main_message:
                     for msg in main_message.split("\n"):
@@ -276,7 +307,13 @@ class mywindow(QMainWindow, Ui_server_ui):
 
     def threading_car_task(self):
         while self.car_thread_is_running:
-            if self.car_mode == 1:
+            if self.guard:
+                try:
+                    self.guard.update_distance(*self.car.sonic.get_fresh_sample())
+                except Exception:
+                    logging.exception("Ultrasonic safety sensor unavailable")
+                    self.guard.update_distance(None)
+            elif self.car_mode == 1:
                 pass
             elif self.car_mode == 2:
                 self.car.mode_light()
@@ -289,7 +326,7 @@ class mywindow(QMainWindow, Ui_server_ui):
             time.sleep(0.01)
 
 
-    def set_threading_video_send(self, state, close_time=0.3):
+    def set_threading_video_send(self, state, close_time=1.2):
         if self.video_thread is None:
             buf_state = False
         else:
@@ -309,13 +346,15 @@ class mywindow(QMainWindow, Ui_server_ui):
         while self.video_thread_is_running:
             if self.tcp_server.is_video_server_connected():
                 self.camera.start_stream()
-                while self.tcp_server.is_video_server_connected():
+                while self.video_thread_is_running and self.tcp_server.is_video_server_connected():
                     frame = self.camera.get_frame()
+                    if frame is None:
+                        logging.warning("Camera frame timeout")
+                        continue
                     lenFrame = len(frame)
                     lengthBin = struct.pack('<I', lenFrame)
                     try:
-                        self.tcp_server.send_data_to_video_client(lengthBin)
-                        self.tcp_server.send_data_to_video_client(frame)
+                        self.tcp_server.send_data_to_video_client(lengthBin + frame)
                     except:
                         break
                 self.camera.stop_stream()
@@ -395,6 +434,8 @@ class mywindow(QMainWindow, Ui_server_ui):
 
     def close_application(self):
         self.ui_button_state = False
+        if self.guard:
+            self.guard.close()
         self.set_threading_cmd_receive(False)
         self.set_threading_video_send(False)
         self.set_threading_car_task(False)
@@ -413,7 +454,7 @@ class mywindow(QMainWindow, Ui_server_ui):
             self.led_process.terminate()
             self.led_process.join(0.1)
         self.app.quit()
-        sys.exit(1)
+        sys.exit(0)
 
     def signal_handler(self, signal, frame):
         print("Caught Ctrl+C, stopping application...")
@@ -430,15 +471,37 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Freenove 4WD Smart Car Server')
     parser.add_argument('-t', '--terminal', action='store_true', help='Run in terminal mode (no GUI)')
     parser.add_argument('-n', '--no-gui', action='store_true', help='Run in terminal mode (no GUI)')
+    parser.add_argument('--ai-safe', action='store_true', help='Guarded laptop driver; disables all servo and legacy movement modes')
+    parser.add_argument('--bind', default=None)
+    parser.add_argument('--command-port', type=int, default=5000)
+    parser.add_argument('--video-port', type=int, default=8000)
+    parser.add_argument('--watchdog', type=float, default=1.0)
+    parser.add_argument('--max-duration', type=float, default=0.75)
+    parser.add_argument('--threshold', type=float, default=30.0)
     
     args = parser.parse_args()
+    if args.ai_safe:
+        from parameter import ParameterManager
+        parameters = ParameterManager.__new__(ParameterManager)
+        if not parameters.validate_params():
+            parser.error('Configure hardware first: run python3 parameter.py from Code/Server')
+    log_queue = queue.SimpleQueue()
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(threadName)s %(name)s %(message)s'))
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().addHandler(QueueHandler(log_queue))
+    log_listener = QueueListener(log_queue, console)
+    log_listener.start()
+    import atexit
+    atexit.register(log_listener.stop)
     
     # Check if either flag is set
     headless_mode = args.terminal or args.no_gui
     if headless_mode:
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
         # Run in headless mode - only start server functionality
         app = QApplication(sys.argv)
-        server_window = mywindow()
+        server_window = mywindow(args)
         
         # Start the server automatically
         if server_window.label.text() == "Server Off":
@@ -455,6 +518,6 @@ if __name__ == '__main__':
             sys.exit(0)
     else:
         # Run with GUI (existing behavior)
-        myshow = mywindow()
+        myshow = mywindow(args)
         myshow.show()
         sys.exit(myshow.app.exec_())

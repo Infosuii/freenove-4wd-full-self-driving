@@ -1,0 +1,13 @@
+{
+  "pi_host": "raspberrypi.local",
+  "command_port": 5000,
+  "video_port": 8000,
+  "ollama_host": "127.0.0.1",
+  "ollama_port": 11434,
+  "model": "qwen2.5vl:7b",
+  "loop_interval": 0.2,
+  "max_action_duration": 0.75,
+  "manual_duration": 0.35,
+  "watchdog_timeout": 1.0,
+  "ultrasonic_threshold": 30.0
+}
